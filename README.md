@@ -94,6 +94,63 @@ curl http://localhost:5102/api/consolidado/2026-10-26 -H "Authorization: Bearer 
 
 Se `data` não for informada ao lançar, vale o dia atual no fuso `America/Sao_Paulo` (configurável em `Negocio:FusoHorario`).
 
+## Modelo arquitetural e por quê
+
+**Modelo adotado:** microsserviços enxutos (2 serviços), orientados a eventos, com CQRS entre escrita e leitura, um banco por serviço e arquitetura em camadas dentro de cada serviço.
+
+O ponto de partida é o requisito não funcional do enunciado: *o controle de lançamentos não pode ficar indisponível se o consolidado cair*. Isso pede que os dois sejam unidades independentes, e as demais decisões decorrem disso.
+
+| Decisão | Por quê | Alternativa descartada |
+|---|---|---|
+| **2 serviços (Lancamentos e Consolidado)** | A falha de um não pode derrubar o outro. A fronteira entre eles é natural: um escreve, o outro lê | **Monolito:** uma falha ou sobrecarga no relatório derrubaria os lançamentos. **Mais serviços** (auth, gateway, relatórios): complexidade operacional sem ganho neste escopo. **Serverless:** serviria ao consolidado, mas prende o projeto a um provedor |
+| **Banco por serviço** | Isolamento de falha e evolução independente do schema | Banco compartilhado: a queda do banco derrubaria os dois |
+| **CQRS entre os serviços** | Escrita e leitura têm perfis de carga diferentes (poucas escritas × 50 req/s de leitura em pico) e escalam separadamente. O consolidado é uma projeção que pode ser reconstruída | Um único modelo para ler e escrever |
+| **Orientação a eventos + Transactional Outbox** | O lançamento e o evento são gravados na mesma transação. O usuário não espera o consolidado, e nenhum evento se perde se ele estiver fora | Chamar o consolidado direto na requisição: acopla a disponibilidade dos dois |
+| **Consumidor idempotente** | A entrega é "pelo menos uma vez", então o consolidado ignora eventos repetidos. Como a operação é uma soma, a ordem de chegada não importa | Assumir entrega exatamente uma vez, o que não é garantido |
+| **Cache em memória no consolidado** | Atende o pico de 50 req/s sem tocar no banco, com invalidação a cada evento aplicado | Consultar o banco a cada requisição |
+| **Camadas em pastas, não em projetos** | O domínio é pequeno; 4 assemblies por serviço seriam cerimônia sem benefício | Clean/Hexagonal com um projeto por camada |
+| **HTTP no lugar de um broker** | Concessão para rodar só com `dotnet run`, sem Docker. A troca é isolada em `IEventPublisher` ([ADR-003](docs/adr/003-http-no-lugar-de-broker-por-enquanto.md)) | RabbitMQ/Kafka, previstos em [docs/evolucao.md](docs/evolucao.md) |
+| **JWT + API key interna** | JWT para o usuário nos endpoints de negócio; no fluxo entre serviços não há usuário, então uma API key é mais adequada | JWT de usuário na chamada interna |
+
+**Contrapartida aceita:** consistência eventual (o consolidado pode ficar alguns segundos atrás dos lançamentos) e mais pontos de deploy e monitoramento.
+
+### Padrões de projeto e arquitetura: quais e por quê
+
+| Padrão | Onde está | Por que foi usado |
+|---|---|---|
+| **Transactional Outbox** | Gravação em [LancamentoService.RegistrarAsync](src/Lancamentos.Api/Application/LancamentoService.cs#L34) (lançamento e `OutboxMessage` no mesmo `SaveChanges`); entrega em [OutboxWorker](src/Lancamentos.Api/Infrastructure/OutboxPublisher.cs#L34); entidade em [OutboxMessage](src/Lancamentos.Api/Domain/OutboxMessage.cs) | Garante que lançamento e evento nunca fiquem inconsistentes, sem transação distribuída |
+| **Retry com backoff exponencial** | [OutboxMessage.RegistrarFalha](src/Lancamentos.Api/Domain/OutboxMessage.cs#L47), acionado em [OutboxWorker.ProcessarLoteAsync](src/Lancamentos.Api/Infrastructure/OutboxPublisher.cs#L66) | Dá tempo ao consolidado de se recuperar sem ser sobrecarregado; o lote é interrompido na primeira falha |
+| **Background Worker** | [OutboxWorker](src/Lancamentos.Api/Infrastructure/OutboxPublisher.cs#L34) (`BackgroundService`), registrado em [Program.cs](src/Lancamentos.Api/Program.cs#L29-L30) | Entrega os eventos fora da requisição do usuário |
+| **Idempotent Consumer** | [ConsolidadoService.AplicarEventoAsync](src/Consolidado.Api/Application/ConsolidadoService.cs#L50) (checa `EventosProcessados`, linha 55) e [EventoProcessado](src/Consolidado.Api/Domain/SaldoDiario.cs#L37) | Torna seguro reenviar eventos |
+| **CQRS** | [Lancamentos.Api](src/Lancamentos.Api) (escrita) × [Consolidado.Api](src/Consolidado.Api) (leitura) | Escala e otimiza leitura e escrita de forma independente |
+| **Event-driven** | Contrato `LancamentoRegistradoEvent` em [OutboxMessage.cs](src/Lancamentos.Api/Domain/OutboxMessage.cs#L9), recebido por [EventosController](src/Consolidado.Api/Controllers/EventosController.cs) | Os serviços só se comunicam por eventos, sem acesso ao banco um do outro |
+| **Cache-aside** | [ConsolidadoService.ConsultarAsync](src/Consolidado.Api/Application/ConsolidadoService.cs#L81); invalidação em [linha 72](src/Consolidado.Api/Application/ConsolidadoService.cs#L72); `AddMemoryCache` em [Program.cs](src/Consolidado.Api/Program.cs#L11) | Reduz a carga de leitura no pico de 50 req/s |
+| **Factory Method com invariantes no domínio** | [Lancamento.Criar](src/Lancamentos.Api/Domain/Lancamento.cs#L26) | Impede a existência de um lançamento inválido (valor positivo, 2 casas decimais) |
+| **Entidade rica (DDD)** | [Lancamento](src/Lancamentos.Api/Domain/Lancamento.cs), [SaldoDiario.Aplicar](src/Consolidado.Api/Domain/SaldoDiario.cs#L17), [OutboxMessage](src/Lancamentos.Api/Domain/OutboxMessage.cs) | As regras ficam na entidade, não espalhadas nos serviços |
+| **Strategy / Dependency Inversion** | [IEventPublisher](src/Lancamentos.Api/Infrastructure/OutboxPublisher.cs#L12) e `TimeProvider` ([Program.cs](src/Lancamentos.Api/Program.cs#L15)) | O transporte e o relógio são trocáveis e testáveis |
+| **Camadas (Controllers → Application → Domain → Infrastructure)** | Pastas de cada serviço em [src/](src) | Separa HTTP, casos de uso, regras e acesso a dados |
+| **DTOs imutáveis (`record`)** | [RegistrarLancamentoRequest e LancamentoResponse](src/Lancamentos.Api/Application/LancamentoService.cs#L7-L13); [SaldoDiarioResponse](src/Consolidado.Api/Application/ConsolidadoService.cs#L16) | Contratos simples, sem estado mutável compartilhado |
+| **Tratamento centralizado de erros** | `UseExceptionHandler` em [Program.cs](src/Lancamentos.Api/Program.cs#L52-L64), com `DominioException` | Erros de regra viram 400 sem vazar stack trace |
+| **Health checks** | `AddHealthChecks`/`/health` em [Lancamentos](src/Lancamentos.Api/Program.cs#L13) e [Consolidado](src/Consolidado.Api/Program.cs#L12) | Permitem probes de orquestrador e monitoramento |
+| **Autenticação JWT + API key** | JWT em [Program.cs](src/Lancamentos.Api/Program.cs#L32-L47); API key com `FixedTimeEquals` em [EventosController](src/Consolidado.Api/Controllers/EventosController.cs#L47) | Protege os endpoints; a comparação em tempo constante evita ataque de temporização |
+| **Controle de concorrência** | `SemaphoreSlim` em [ConsolidadoService](src/Consolidado.Api/Application/ConsolidadoService.cs#L36) | Evita perda de atualização no "lê, soma, grava" do saldo (num banco de servidor vira `UPDATE` atômico) |
+
+### SOLID: por quê
+
+Os cinco princípios foram aplicados. Onde cada um aparece:
+
+| Princípio | Onde está no código | Por quê |
+|---|---|---|
+| **S** — Responsabilidade única | [LancamentosController](src/Lancamentos.Api/Controllers/LancamentosController.cs) (só traduz HTTP); [LancamentoService](src/Lancamentos.Api/Application/LancamentoService.cs#L21) (orquestra o caso de uso); [Lancamento](src/Lancamentos.Api/Domain/Lancamento.cs) (guarda as regras); [OutboxWorker](src/Lancamentos.Api/Infrastructure/OutboxPublisher.cs#L34) (só entrega eventos); [RelogioNegocio](src/Lancamentos.Api/Application/RelogioNegocio.cs) (só resolve o "dia" no fuso do negócio). O mesmo vale em [Consolidado.Api](src/Consolidado.Api) | Cada classe muda por um único motivo: mudar a regra do lançamento não mexe em HTTP nem na entrega de eventos |
+| **O** — Aberto/fechado | [IEventPublisher](src/Lancamentos.Api/Infrastructure/OutboxPublisher.cs#L12), com a implementação [HttpEventPublisher](src/Lancamentos.Api/Infrastructure/OutboxPublisher.cs#L17) | Trocar HTTP por RabbitMQ/Kafka é criar uma nova implementação e registrar em [Program.cs](src/Lancamentos.Api/Program.cs#L22), sem editar `OutboxWorker`, serviço ou domínio |
+| **L** — Substituição de Liskov | `HttpEventPublisher` e o `FakePublisher` dos testes ([LancamentosApiTests.cs](tests/Lancamentos.Tests/LancamentosApiTests.cs#L16)) | Ambos honram o contrato de `IEventPublisher`, então o `OutboxWorker` funciona igual com qualquer um. Isso permite simular a queda do consolidado nos testes |
+| **I** — Segregação de interfaces | [IEventPublisher](src/Lancamentos.Api/Infrastructure/OutboxPublisher.cs#L12) (1 método), [ILancamentoService](src/Lancamentos.Api/Application/LancamentoService.cs#L15) (registrar e listar), [IConsolidadoService](src/Consolidado.Api/Application/ConsolidadoService.cs#L24) | Interfaces pequenas e focadas: o consumidor depende só do que usa. O transporte não conhece regras de lançamento, e o controller não conhece EF Core |
+| **D** — Inversão de dependência | Controllers dependem de `ILancamentoService`/`IConsolidadoService`; `OutboxWorker` depende de `IEventPublisher` e `TimeProvider`. A ligação acontece na composição, em [Program.cs](src/Lancamentos.Api/Program.cs#L15-L27) | O código de negócio não conhece a implementação concreta, e os testes injetam substitutos |
+
+**Limite conhecido:** `LancamentoService` e `ConsolidadoService` dependem diretamente do `DbContext` do EF Core, sem uma interface de repositório. Foi uma escolha consciente: o `DbContext` já implementa Unit of Work e repositório, e os testes do consolidado rodam contra um SQLite real. Com mais complexidade de domínio, eu extrairia repositórios para cumprir o princípio D por completo.
+
+O detalhe de cada ADR está em [docs/adr/](docs/adr) e o desenho completo em [docs/arquitetura.md](docs/arquitetura.md).
+
 ## Relatório de atendimento aos requisitos técnicos obrigatórios
 
 | Requisito | Status | O que foi feito e onde |
