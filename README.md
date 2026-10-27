@@ -94,6 +94,44 @@ curl http://localhost:5102/api/consolidado/2026-10-26 -H "Authorization: Bearer 
 
 Se `data` não for informada ao lançar, vale o dia atual no fuso `America/Sao_Paulo` (configurável em `Negocio:FusoHorario`).
 
+## Relatório de atendimento aos requisitos técnicos obrigatórios
+
+| Requisito | Status | O que foi feito e onde |
+|---|---|---|
+| **Desenho da solução** | Atendido | Diagramas Mermaid de contexto, componentes e sequência (registrar lançamento, consultar consolidado, idempotência) em [docs/arquitetura.md](docs/arquitetura.md); visão geral neste README; decisões registradas em [docs/adr/](docs/adr) (ADR-001 a 004) |
+| **Feito em C#** | Atendido | .NET 10 / ASP.NET Core: [src/Lancamentos.Api](src/Lancamentos.Api) e [src/Consolidado.Api](src/Consolidado.Api), com EF Core |
+| **Testes** | Atendido | 24 testes em [tests/](tests): unidade de domínio, unidade de serviço e integração de API (`WebApplicationFactory`), incluindo o cenário de queda do consolidado. Teste de carga k6 em [scripts/carga-consolidado.js](scripts/carga-consolidado.js) |
+| **Boas práticas** | Atendido | Detalhado abaixo |
+| **README com instruções** | Atendido | Seções "Como rodar", "Testando a resiliência" e "Usando a API" neste arquivo; [requests.http](requests.http) e [scripts/](scripts) para execução e demonstração |
+
+### Padrões e boas práticas aplicados
+
+| Prática | Onde |
+|---|---|
+| **Arquitetura em camadas** (Controllers → Application → Domain → Infrastructure) | Pastas de cada serviço em `src/` |
+| **Transactional Outbox** | `OutboxMessage` ([Domain](src/Lancamentos.Api/Domain/OutboxMessage.cs)), gravada junto com o lançamento em `LancamentoService`; entrega por `OutboxWorker` ([Infrastructure/OutboxPublisher.cs](src/Lancamentos.Api/Infrastructure/OutboxPublisher.cs)) |
+| **Retry com backoff exponencial** | `OutboxMessage.RegistrarFalha` |
+| **Idempotent Consumer** | `EventoProcessado` e `ConsolidadoService` ([Consolidado.Api](src/Consolidado.Api)) |
+| **CQRS** (escrita × leitura em serviços separados) | Lancamentos.Api × Consolidado.Api |
+| **Cache-aside** | `ConsolidadoService.ConsultarAsync` com `IMemoryCache` |
+| **Factory Method + invariantes no domínio** | `Lancamento.Criar` ([Domain/Lancamento.cs](src/Lancamentos.Api/Domain/Lancamento.cs)) |
+| **Domain-driven (entidades com regras)** | `Lancamento`, `SaldoDiario`, `DominioException` |
+| **Strategy / Dependency Inversion** | `IEventPublisher` → `HttpEventPublisher`; `TimeProvider` injetado |
+| **Injeção de dependência** | `Program.cs` de cada serviço |
+| **DTOs imutáveis** | `record` (`RegistrarLancamentoRequest`, `LancamentoResponse`, `SaldoDiarioResponse`, `LancamentoRegistradoEvent`) |
+| **Health checks** | `/health` nos dois serviços |
+| **Segurança** | JWT nos endpoints de negócio; API key (comparação em tempo constante) no endpoint interno `/internal/eventos` |
+
+### SOLID
+
+| Princípio | Aplicação |
+|---|---|
+| **S** — Responsabilidade única | Controller só traduz HTTP; `*Service` orquestra o caso de uso; entidade guarda as regras; `OutboxWorker` só entrega eventos |
+| **O** — Aberto/fechado | Trocar HTTP por um broker é uma nova implementação de `IEventPublisher`, sem alterar serviço nem domínio |
+| **L** — Substituição de Liskov | Qualquer `IEventPublisher` (HTTP, falso nos testes) é intercambiável |
+| **I** — Segregação de interfaces | Interfaces pequenas e focadas: `IEventPublisher`, `ILancamentoService`, `IConsolidadoService` |
+| **D** — Inversão de dependência | Serviços dependem de abstrações (`IEventPublisher`, `TimeProvider`), resolvidas na composição (`Program.cs`) |
+
 ## Testes
 
 ```bash
