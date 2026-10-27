@@ -1,0 +1,39 @@
+### Requisicoes de exemplo (extensao REST Client do VS Code ou HTTP files do Visual Studio)
+
+@lanc = http://localhost:5101
+@cons = http://localhost:5102
+
+### 1) Obter token
+# @name login
+POST {{lanc}}/auth/token
+Content-Type: application/json
+
+{ "usuario": "comerciante", "senha": "senha123" }
+
+### 2) Registrar um credito
+POST {{lanc}}/api/lancamentos
+Authorization: Bearer {{login.response.body.accessToken}}
+Content-Type: application/json
+
+{ "tipo": "Credito", "valor": 250.00, "descricao": "Venda no balcao" }
+
+### 3) Registrar um debito
+POST {{lanc}}/api/lancamentos
+Authorization: Bearer {{login.response.body.accessToken}}
+Content-Type: application/json
+
+{ "tipo": "Debito", "valor": 90.00, "descricao": "Pagamento de fornecedor" }
+
+### 4) Listar lancamentos do dia (troque a data)
+GET {{lanc}}/api/lancamentos?data=2026-10-26
+Authorization: Bearer {{login.response.body.accessToken}}
+
+### 5) Consolidado diario (troque a data)
+GET {{cons}}/api/consolidado/2026-10-26
+Authorization: Bearer {{login.response.body.accessToken}}
+
+### 6) Health checks
+GET {{lanc}}/health
+
+###
+GET {{cons}}/health
